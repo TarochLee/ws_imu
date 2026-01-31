@@ -325,9 +325,18 @@ void JY901BDriver::handle_frame_(const uint8_t* f) {
            << " tl=" << int(f[8]) << " th=" << int(f[9]);
     // 注意：磁场单位与你机型可能不一致，这里保持你之前假设：raw 为 mG -> Tesla=raw*1e-7
     std::lock_guard<std::mutex> lk(data_mtx_);
-    cached_.magnetic_field.x = double(mx) * 1e-7;
-    cached_.magnetic_field.y = double(my) * 1e-7;
-    cached_.magnetic_field.z = double(mz) * 1e-7;
+    // cached_.magnetic_field.x = double(mx) * 1e-7;
+    // cached_.magnetic_field.y = double(my) * 1e-7;
+    // cached_.magnetic_field.z = double(mz) * 1e-7;
+
+    // JY901 固定 AK8963：0.15 uT/LSB
+    // 1 uT = 1e-6 Tesla -> Tesla/LSB = 0.15e-6 = 1.5e-7
+    static constexpr double kMagTeslaPerLSB = 0.15e-6;
+
+    cached_.magnetic_field.x = double(mx) * kMagTeslaPerLSB;
+    cached_.magnetic_field.y = double(my) * kMagTeslaPerLSB;
+    cached_.magnetic_field.z = double(mz) * kMagTeslaPerLSB;
+
     return;
   }
 
