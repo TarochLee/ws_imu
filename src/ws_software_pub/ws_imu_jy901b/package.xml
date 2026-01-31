@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>ws_imu_jy901b</name>
+  <version>2.0.0</version>
+  <description>JY901B driver with glog, state machine, ring buffer, 5s reconnect</description>
+
+  <maintainer email="baater@todo.todo">baater</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tenaxis_msg</depend>
+  <depend>boost</depend>
+  <depend>glog</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

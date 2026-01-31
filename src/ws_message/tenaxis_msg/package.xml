@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>tenaxis_msg</name>
+  <version>1.0.0</version>
+  <description>Ten-axis IMU 自定义消息定义（SI 单位）</description>
+  <maintainer email="baater@todo.todo">baater</maintainer>
+  <license>TODO: License declaration</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- 生成消息接口所需 -->
+  <build_depend>rosidl_default_generators</build_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+
+  <!-- .msg 中用到的类型依赖 -->
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+
+  <!-- 声明这是接口包（必须） -->
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <!-- 测试/代码规范（保留你原来的） -->
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
