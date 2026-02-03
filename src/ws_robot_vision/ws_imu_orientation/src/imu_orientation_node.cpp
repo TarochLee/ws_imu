@@ -13,7 +13,6 @@
 #include "tf2/LinearMath/Quaternion.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
-// TODO: 如果你的消息名不同，请改这里
 #include "tenaxis_msg/msg/tenaxis_imu.hpp"
 
 using std::placeholders::_1;
