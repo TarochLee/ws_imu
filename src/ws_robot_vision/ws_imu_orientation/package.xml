@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>ws_imu_orientation</name>
+  <version>0.0.1</version>
+  <description>
+    Visualize IMU orientation in RViz2 using Euler angles (ENU),
+    publishing sensor_msgs/Imu and axis markers with text labels.
+  </description>
+
+  <maintainer email="you@example.com">your_name</maintainer>
+  <license>Apache-2.0</license>
+
+  <!-- Build system -->
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- Core ROS2 -->
+  <depend>rclcpp</depend>
+
+  <!-- Messages -->
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>visualization_msgs</depend>
+
+  <!-- TF utilities -->
+  <depend>tf2</depend>
+  <depend>tf2_geometry_msgs</depend>
+
+  <!-- Custom IMU message -->
+  <depend>tenaxis_msg</depend>
+
+  <!-- Runtime only (launch + rviz) -->
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <!-- For colcon / ament index -->
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
