@@ -9,3 +9,5 @@ tmp/
 *.pyc
 __pycache__/
 .vscode/
+
+debug.*
