@@ -62,7 +62,7 @@ namespace robot_localization_z
 
   template <typename T>
   RosFilter<T>::RosFilter(const rclcpp::NodeOptions &options)
-      : Node(options.arguments()[0], options),
+      : Node("ekf_filter_node", options),
         print_diagnostics_(true),
         publish_acceleration_(false),
         publish_transform_(true),
@@ -153,12 +153,30 @@ namespace robot_localization_z
     // clear last message timestamp, so older messages will be accepted
     last_message_times_.clear();
 
+    // 清理诊断缓存与级别，避免 reset 后 status/status_msg 残留
+    static_diagnostics_.clear();
+    dynamic_diagnostics_.clear();
+    static_diag_error_level_ = diagnostic_msgs::msg::DiagnosticStatus::OK;
+    dynamic_diag_error_level_ = diagnostic_msgs::msg::DiagnosticStatus::OK;
+
     // reset filter to uninitialized state
     filter_.reset();
     // （如果你加了 mutex，就 lock 一下再 clear。）
     std::lock_guard<std::mutex> lock(baro_mutex_);
     initial_baro_z_.clear();
     odom_z_seq_.store(0);
+
+    {
+      std::lock_guard<std::mutex> lk(baro_dbg_mutex_);
+      last_baro_stamp_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+      last_baro_innov_m_ = -1.0;
+      last_baro_innov_var_ = -1.0;
+      last_baro_seen_ = false;
+    }
+    {
+      last_imu_acc_stamp_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+      last_imu_acc_seen_ = false;
+    }
   }
 
   template <typename T>
@@ -243,6 +261,13 @@ namespace robot_localization_z
             topic_name, measurement, measurement_covariance,
             update_vector_corrected,
             callback_data.rejection_threshold_, msg->header.stamp);
+
+        {
+          std::lock_guard<std::mutex>
+              lk(imu_acc_dbg_mutex_);
+          last_imu_acc_stamp_ = msg->header.stamp;
+          last_imu_acc_seen_ = true;
+        }
 
         RF_DEBUG(
             "Enqueued new measurement for " << topic_name << "_acceleration\n");
@@ -697,13 +722,17 @@ namespace robot_localization_z
     //       rclcpp::Time(msg->header.stamp));
     // }
     // 2) altitude_m 作为 Z 观测：enqueueMeasurement()
+    // 2) altitude_m 作为 Z 观测：enqueueMeasurement()
     if (use_baro)
     {
       // 给 baro 单独的“逻辑 topic 名”，避免和 IMU 的 last_message_times_ 混在一起
       const std::string baro_topic_name = topic_name + "_baro_z";
 
+      // 统一把 stamp 转成 rclcpp::Time，后续所有比较/记录都用它
+      const rclcpp::Time stamp(msg->header.stamp);
+
       // reset 后忽略旧消息（与其他 callback 一致）
-      if (last_set_pose_time_ >= msg->header.stamp)
+      if (last_set_pose_time_ >= stamp)
       {
         return;
       }
@@ -711,16 +740,16 @@ namespace robot_localization_z
       // 初始化 last_message_times_
       if (last_message_times_.count(baro_topic_name) == 0)
       {
-        last_message_times_.insert({baro_topic_name, rclcpp::Time(msg->header.stamp)});
+        last_message_times_.insert({baro_topic_name, stamp});
       }
 
       // 时间戳倒退则丢弃
-      if (last_message_times_[baro_topic_name] > msg->header.stamp)
+      if (last_message_times_[baro_topic_name] > stamp)
       {
         std::stringstream stream;
         stream << "The " << baro_topic_name << " message has a timestamp before that of "
                << "the previous message received; ignored. (message time: "
-               << msg->header.stamp.nanosec << ")";
+               << filter_utilities::toSec(stamp) << ")";
         addDiagnostic(diagnostic_msgs::msg::DiagnosticStatus::WARN,
                       baro_topic_name + "_timestamp", stream.str(), false);
         return;
@@ -729,18 +758,7 @@ namespace robot_localization_z
       // 读原始高度
       double z = static_cast<double>(msg->altitude_m);
 
-      // 这里实现“相对高度”：首帧作为 0 点
-      // 你可以用 topic_name + "_baro_z" 作为 key，这样 tenaxis0/tenaxis1 各自独立
-      // auto it = initial_baro_z_.find(baro_topic_name);
-      // if (it == initial_baro_z_.end())
-      // {
-      //   initial_baro_z_[baro_topic_name] = z;
-      //   z = 0.0;
-      // }
-      // else
-      // {
-      //   z -= it->second;
-      // }
+      // 相对高度：首帧作为 0 点
       if (baro_relative)
       {
         double z0 = 0.0;
@@ -760,7 +778,6 @@ namespace robot_localization_z
         }
         z = first ? 0.0 : (z - z0);
       }
-      // else: z 保持为 msg->altitude_m 的绝对值（不归零、不减首帧）
 
       // 方差健壮性：必须 > 0
       double var = baro_variance;
@@ -782,15 +799,36 @@ namespace robot_localization_z
       R.setZero();
       R(StateMemberZ, StateMemberZ) = var;
 
+      // 计算近似创新量（debug）
+      double z_pred = 0.0;
+      double Pzz = 0.0;
+      if (filter_.getInitializedStatus())
+      {
+        const Eigen::VectorXd &st = filter_.getState();
+        const Eigen::MatrixXd &P = filter_.getEstimateErrorCovariance();
+        z_pred = st(StateMemberZ);
+        Pzz = P(StateMemberZ, StateMemberZ);
+      }
+      const double innov = z - z_pred;
+      const double innov_var = Pzz + var;
+
+      {
+        std::lock_guard<std::mutex> lk(baro_dbg_mutex_);
+        last_baro_stamp_ = stamp;
+        last_baro_innov_m_ = innov;
+        last_baro_innov_var_ = innov_var;
+        last_baro_seen_ = true;
+      }
+
       enqueueMeasurement(
           baro_topic_name,
           meas,
           R,
           baro_update_vector,
           baro_mahalanobis_thresh,
-          rclcpp::Time(msg->header.stamp));
+          stamp);
 
-      last_message_times_[baro_topic_name] = msg->header.stamp;
+      last_message_times_[baro_topic_name] = stamp;
     }
   }
 
@@ -1990,12 +2028,6 @@ namespace robot_localization_z
             tenaxis_topic_name + "_acceleration", accel_update_vec, accel_update_sum,
             differential, relative, accel_mahalanobis_thresh);
 
-        // std::function<void(const std::shared_ptr<tenaxis_msg::msg::TenaxisImu>)>
-        //     tenaxis_callback =
-        //         std::bind(&RosFilter<T>::tenaxisCallback, this, std::placeholders::_1,
-        //                   tenaxis_topic_name, pose_callback_data, twist_callback_data, accel_callback_data,
-        //                   baro_update_vector, baro_mahalanobis_thresh, baro_variance,
-        //                   ori_var, gyr_var, acc_var, use_baro);
         std::function<void(const std::shared_ptr<tenaxis_msg::msg::TenaxisImu>)>
             tenaxis_callback =
                 std::bind(&RosFilter<T>::tenaxisCallback, this, std::placeholders::_1,
@@ -2009,11 +2041,38 @@ namespace robot_localization_z
                 tenaxis_topic, custom_qos, tenaxis_callback));
 
         RF_DEBUG("Subscribed to " << tenaxis_topic << " (" << tenaxis_topic_name << ")");
+
+        // ---- 统计 tenaxis 对观测的贡献（用于 print_diagnostics_）----
+        if (pose_update_sum > 0)
+        {
+          if (differential)
+          {
+            twist_var_counts[StateMemberVroll] += pose_update_vec[StateMemberRoll];
+            twist_var_counts[StateMemberVpitch] += pose_update_vec[StateMemberPitch];
+            twist_var_counts[StateMemberVyaw] += pose_update_vec[StateMemberYaw];
+          }
+          else
+          {
+            abs_pose_var_counts[StateMemberRoll] += pose_update_vec[StateMemberRoll];
+            abs_pose_var_counts[StateMemberPitch] += pose_update_vec[StateMemberPitch];
+            abs_pose_var_counts[StateMemberYaw] += pose_update_vec[StateMemberYaw];
+            // 注意：tenaxis 的 pose_update_vec 里 X/Y/Z 在上面已被置为 0，通常为 0
+          }
+        }
+        if (twist_update_sum > 0)
+        {
+          twist_var_counts[StateMemberVroll] += twist_update_vec[StateMemberVroll];
+          twist_var_counts[StateMemberVpitch] += twist_update_vec[StateMemberVpitch];
+          twist_var_counts[StateMemberVyaw] += twist_update_vec[StateMemberVyaw];
+        }
+        // baro 提供绝对 Z
+        if (use_baro)
+        {
+          abs_pose_var_counts[StateMemberZ] += 1;
+        }
       }
     } while (more_params);
 
-    // Now that we've checked if IMU linear acceleration is being used, we can
-    // determine our final control parameters
     if (use_control_ && std::accumulate(
                             control_update_vector.begin(),
                             control_update_vector.end(), 0) == 0)
@@ -2056,10 +2115,19 @@ namespace robot_localization_z
      *    1. Multiple non-differential input sources
      *    2. No absolute *or* velocity measurements for pose variables
      */
+    bool z_axis_only = this->declare_parameter("z_axis_only", true);
     if (print_diagnostics_)
     {
       for (int state_var = StateMemberX; state_var <= StateMemberYaw; ++state_var)
       {
+        if (z_axis_only)
+        {
+          // 只对 Z 做“必须可观测”检查（你也可以把 yaw/roll/pitch 加进来）
+          if (state_var != StateMemberZ)
+          {
+            continue;
+          }
+        }
         if (abs_pose_var_counts[static_cast<StateMembers>(state_var)] > 1)
         {
           std::stringstream stream;
@@ -2425,160 +2493,45 @@ namespace robot_localization_z
 
     if (getFilteredOdometryMessage(filtered_position.get()))
     {
-      world_base_link_trans_msg_.header.stamp =
-          static_cast<rclcpp::Time>(filtered_position->header.stamp) + tf_time_offset_;
-      world_base_link_trans_msg_.header.frame_id =
-          filtered_position->header.frame_id;
-      world_base_link_trans_msg_.child_frame_id =
-          filtered_position->child_frame_id;
+      // 先缓存 stamp / frame / child（后面都用缓存，不要再碰 filtered_position 指针）
+      const rclcpp::Time filt_stamp(filtered_position->header.stamp);
+      const std::string filt_frame = filtered_position->header.frame_id;
+      const std::string filt_child = filtered_position->child_frame_id;
 
-      world_base_link_trans_msg_.transform.translation.x =
-          filtered_position->pose.pose.position.x;
-      world_base_link_trans_msg_.transform.translation.y =
-          filtered_position->pose.pose.position.y;
-      world_base_link_trans_msg_.transform.translation.z =
-          filtered_position->pose.pose.position.z;
-      world_base_link_trans_msg_.transform.rotation =
-          filtered_position->pose.pose.orientation;
-
-      // The filtered_position is the message containing the state and covariances:
-      // nav_msgs Odometry
-      if (!validateFilterOutput(filtered_position.get()))
-      {
-        RCLCPP_ERROR(
-            this->get_logger(),
-            "Critical Error, NaNs were detected in the output state of the filter. "
-            "This was likely due to poorly coniditioned process, noise, or sensor "
-            "covariances.");
-      }
-
-      // If we're trying to publish with the same time stamp, it means that we had a measurement get
-      // inserted into the filter history, and our state estimate was updated after it was already
-      // published. As of ROS Noetic, TF2 will issue warnings whenever this occurs, so we make this
-      // behavior optional. Just for safety, we also check for the condition where the last published
-      // stamp is *later* than this stamp. This should never happen, but we should handle the case
-      // anyway.
+      // corrected_data 判断也用缓存的 stamp
       corrected_data = (!permit_corrected_publication_ &&
-                        last_published_stamp_ >= filtered_position->header.stamp);
+                        last_published_stamp_ >= filt_stamp);
 
-      // If the world_frame_id_ is the odom_frame_id_ frame, then we can just
-      // send the transform. If the world_frame_id_ is the map_frame_id_ frame,
-      // we'll have some work to do.
-      if (publish_transform_ && !corrected_data)
-      {
-        if (filtered_position->header.frame_id == odom_frame_id_)
-        {
-          world_transform_broadcaster_->sendTransform(world_base_link_trans_msg_);
-        }
-        else if (filtered_position->header.frame_id == map_frame_id_)
-        {
-          try
-          {
-            tf2::Transform world_base_link_trans;
-            tf2::fromMsg(
-                world_base_link_trans_msg_.transform,
-                world_base_link_trans);
+      // TF 用缓存值（必要时）
+      world_base_link_trans_msg_.header.stamp = filt_stamp + tf_time_offset_;
+      world_base_link_trans_msg_.header.frame_id = filt_frame;
+      world_base_link_trans_msg_.child_frame_id = filt_child;
 
-            tf2::Transform base_link_odom_trans;
-            tf2::fromMsg(
-                tf_buffer_
-                    ->lookupTransform(
-                        base_link_frame_id_,
-                        odom_frame_id_,
-                        tf2::TimePointZero)
-                    .transform,
-                base_link_odom_trans);
+      world_base_link_trans_msg_.transform.translation.x = filtered_position->pose.pose.position.x;
+      world_base_link_trans_msg_.transform.translation.y = filtered_position->pose.pose.position.y;
+      world_base_link_trans_msg_.transform.translation.z = filtered_position->pose.pose.position.z;
+      world_base_link_trans_msg_.transform.rotation = filtered_position->pose.pose.orientation;
 
-            /*
-             * First, see these two references:
-             * http://wiki.ros.org/tf/Overview/Using%20Published%20Transforms#lookupTransform
-             * http://wiki.ros.org/geometry/CoordinateFrameConventions#Transform_Direction
-             * We have a transform from map_frame_id_->base_link_frame_id_, but
-             * it would actually transform a given pose from
-             * base_link_frame_id_->map_frame_id_. We then used lookupTransform,
-             * whose first two arguments are target frame and source frame, to
-             * get a transform from base_link_frame_id_->odom_frame_id_.
-             * However, this transform would actually transform data from
-             * odom_frame_id_->base_link_frame_id_. Now imagine that we have a
-             * position in the map_frame_id_ frame. First, we multiply it by the
-             * inverse of the map_frame_id_->baseLinkFrameId, which will
-             * transform that data from map_frame_id_ to base_link_frame_id_.
-             * Now we want to go from base_link_frame_id_->odom_frame_id_, but
-             * the transform we have takes data from
-             * odom_frame_id_->base_link_frame_id_, so we need its inverse as
-             * well. We have now transformed our data from map_frame_id_ to
-             * odom_frame_id_. However, if we want other users to be able to do
-             * the same, we need to broadcast the inverse of that entire
-             * transform.
-             */
-            tf2::Transform map_odom_trans;
-            map_odom_trans.mult(world_base_link_trans, base_link_odom_trans);
-
-            geometry_msgs::msg::TransformStamped map_odom_trans_msg;
-            map_odom_trans_msg.transform = tf2::toMsg(map_odom_trans);
-            map_odom_trans_msg.header.stamp =
-                static_cast<rclcpp::Time>(filtered_position->header.stamp) + tf_time_offset_;
-            map_odom_trans_msg.header.frame_id = map_frame_id_;
-            map_odom_trans_msg.child_frame_id = odom_frame_id_;
-
-            world_transform_broadcaster_->sendTransform(map_odom_trans_msg);
-          }
-          catch (...)
-          {
-            // ROS_ERROR_STREAM_DELAYED_THROTTLE(5.0, "Could not obtain
-            // transform from "
-            //                                  << odom_frame_id_ << "->" <<
-            //                                  base_link_frame_id_);
-          }
-        }
-        else
-        {
-          std::cerr << "Odometry message frame_id was " << filtered_position->header.frame_id << ", expected " << map_frame_id_ << " or " << odom_frame_id_ << "\n";
-        }
-      }
-
-      // // For custom Z-axis odometry output: compute dt using previous published stamp
-      // const double dt_s = (rclcpp::Time(filtered_position->header.stamp) - last_published_stamp_).seconds();
-
-      // // Retain the last published stamp so we can detect repeated transforms in future cycles
-      // last_published_stamp_ = filtered_position->header.stamp;
+      // dt_s 用缓存 stamp
       double dt_s = 0.0;
       if (last_published_stamp_.nanoseconds() > 0)
       {
-        dt_s = (rclcpp::Time(filtered_position->header.stamp) - last_published_stamp_).seconds();
+        dt_s = (filt_stamp - last_published_stamp_).seconds();
       }
-      last_published_stamp_ = filtered_position->header.stamp;
+      last_published_stamp_ = filt_stamp;
 
-      // Fire off the position and the transform
-      if (!corrected_data)
+      // 发布自定义 /odom/z —— 注意这里不依赖 filtered_position 指针
+      if (!corrected_data && odom_z_pub_)
       {
-        position_pub_->publish(std::move(filtered_position));
-      }
-
-      // Publish custom 1D Z-axis odometry message on /odom/z
-      if (odom_z_pub_)
-      {
-        // odometry_z_axis::msg::OdometryZAxis zmsg;
-        // zmsg.header = filtered_position->header;
-        // zmsg.frame_id = world_frame_id_;
-        // zmsg.child_frame_id = base_link_output_frame_id_;
-
         odometry_z_axis::msg::OdometryZAxis zmsg;
+        zmsg.header.stamp = filt_stamp; // 或 this->now()，但建议用滤波时间戳
+        zmsg.header.frame_id = world_frame_id_;
 
-        // 1) header：不要再引用 filtered_position
-        zmsg.header.stamp = this->now();        // 或者用 cur_time（滤波周期时间）
-        zmsg.header.frame_id = world_frame_id_; // 注意：这是 header.frame_id
-
-        // 2) 你自定义消息里的 frame_id / child_frame_id
         zmsg.frame_id = world_frame_id_;
         zmsg.child_frame_id = base_link_output_frame_id_;
 
         const Eigen::VectorXd &state = filter_.getState();
-        const Eigen::MatrixXd &estimate_error_covariance = filter_.getEstimateErrorCovariance();
-
-        // const int Z = StateMember::Z;
-        // const int VZ = StateMember::VZ;
-        // const int AZ = StateMember::AZ;
+        const Eigen::MatrixXd &P = filter_.getEstimateErrorCovariance();
 
         const int Z = StateMemberZ;
         const int VZ = StateMemberVz;
@@ -2588,42 +2541,93 @@ namespace robot_localization_z
         zmsg.vz_mps = state(VZ);
         zmsg.az_mps2 = state(AZ);
 
-        auto safe_var = [](double v) -> double
-        {
-          if (!std::isfinite(v) || v < 0.0)
-          {
-            return -1.0;
-          }
-          return v;
-        };
-        auto safe_std = [](double var) -> double
-        {
-          if (!std::isfinite(var) || var < 0.0)
-          {
-            return -1.0;
-          }
-          return std::sqrt(var);
-        };
+        auto safe_var = [](double v)
+        { return (std::isfinite(v) && v >= 0.0) ? v : -1.0; };
+        auto safe_std = [](double v)
+        { return (std::isfinite(v) && v >= 0.0) ? std::sqrt(v) : -1.0; };
 
-        zmsg.z_var = safe_var(estimate_error_covariance(Z, Z));
-        zmsg.vz_var = safe_var(estimate_error_covariance(VZ, VZ));
-        zmsg.az_var = safe_var(estimate_error_covariance(AZ, AZ));
+        zmsg.z_var = safe_var(P(Z, Z));
+        zmsg.vz_var = safe_var(P(VZ, VZ));
+        zmsg.az_var = safe_var(P(AZ, AZ));
 
         zmsg.z_std = safe_std(zmsg.z_var);
         zmsg.vz_std = safe_std(zmsg.vz_var);
         zmsg.az_std = safe_std(zmsg.az_var);
 
-        // 先给最小可用版本：后续你可以用传感器超时/创新量完善这些字段
         zmsg.valid = true;
-        zmsg.fused_baro = false;
-        zmsg.fused_imu_acc = false;
+        // fused_imu_acc：最近是否融合过任意 IMU/tenaxis 的线加速度（窗口同 sensor_timeout）
+        bool fused_imu_acc = false;
+        {
+          std::lock_guard<std::mutex>
+              lk(imu_acc_dbg_mutex_);
+          if (last_imu_acc_seen_)
+          {
+            const double age = (cur_time - last_imu_acc_stamp_).seconds();
+            const double win = filter_utilities::toSec(filter_.getSensorTimeout());
+            if (age >= 0.0 && age < win)
+            {
+              fused_imu_acc = true;
+            }
+          }
+        }
+        zmsg.fused_imu_acc = fused_imu_acc;
 
-        zmsg.filter_type = 0; // 需要的话可参数化：EKF=1 UKF=2
-        zmsg.status = 0;
-        zmsg.status_msg = "OK";
+        // filter_type：用模板类型区分 Ekf/Ukf（不依赖外部参数）
+        zmsg.filter_type = std::is_same<T, robot_localization_z::Ekf>::value ? 0 : 1;
 
-        zmsg.baro_innov_m = -1.0;
-        zmsg.baro_innov_var = -1.0;
+        // status/status_msg：复用你已有的诊断等级聚合（动态/静态）
+        const int max_err = std::max(static_diag_error_level_, dynamic_diag_error_level_);
+        zmsg.status = max_err;
+        switch (max_err)
+        {
+        case diagnostic_msgs::msg::DiagnosticStatus::OK:
+          zmsg.status_msg = "OK";
+          break;
+        case diagnostic_msgs::msg::DiagnosticStatus::WARN:
+          zmsg.status_msg = "WARN";
+          break;
+        case diagnostic_msgs::msg::DiagnosticStatus::ERROR:
+          zmsg.status_msg = "ERROR";
+          break;
+        case diagnostic_msgs::msg::DiagnosticStatus::STALE:
+          zmsg.status_msg = "STALE";
+          break;
+        default:
+          zmsg.status_msg = "UNKNOWN";
+          break;
+        }
+        // zmsg.fused_baro = false;
+        // zmsg.fused_imu_acc = false;
+
+        // zmsg.filter_type = 0;
+        // zmsg.status = 0;
+        // zmsg.status_msg = "OK";
+
+        // zmsg.baro_innov_m = -1.0;
+        // zmsg.baro_innov_var = -1.0;
+        // fused_baro：用“最近是否收到过 baro 测量”做近似（窗口用 sensor_timeout）
+        bool fused_baro = false;
+        double baro_innov = -1.0;
+        double baro_innov_var = -1.0;
+
+        {
+          std::lock_guard<std::mutex> lk(baro_dbg_mutex_);
+          if (last_baro_seen_)
+          {
+            const double age = (cur_time - last_baro_stamp_).seconds();
+            const double win = filter_utilities::toSec(filter_.getSensorTimeout()); // 或者你自定义 0.2
+            if (age >= 0.0 && age < win)
+            {
+              fused_baro = true;
+              baro_innov = last_baro_innov_m_;
+              baro_innov_var = last_baro_innov_var_;
+            }
+          }
+        }
+
+        zmsg.fused_baro = fused_baro;
+        zmsg.baro_innov_m = baro_innov;
+        zmsg.baro_innov_var = baro_innov_var;
 
         zmsg.dt_s = dt_s;
         zmsg.seq = odom_z_seq_++;
@@ -2631,10 +2635,16 @@ namespace robot_localization_z
         odom_z_pub_->publish(zmsg);
       }
 
-      if (print_diagnostics_)
+      // 最后再 publish filtered_position（move 后就别再用它）
+      if (!corrected_data)
       {
-        freq_diag_->tick();
+        position_pub_->publish(std::move(filtered_position));
       }
+    }
+
+    if (print_diagnostics_)
+    {
+      freq_diag_->tick();
     }
 
     // Publish the acceleration if desired and filter is initialized

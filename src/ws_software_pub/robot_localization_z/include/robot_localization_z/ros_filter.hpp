@@ -351,6 +351,17 @@ namespace robot_localization_z
 
         // /odom/z 的序号（如果 periodicUpdate 可能在多线程执行，建议 atomic）
         std::atomic<uint64_t> odom_z_seq_{0};
+        // baro debug/state for /odom/z
+        std::mutex baro_dbg_mutex_;
+        rclcpp::Time last_baro_stamp_{0, 0, RCL_ROS_TIME};
+        double last_baro_innov_m_{-1.0};
+        double last_baro_innov_var_{-1.0};
+        bool last_baro_seen_{false};
+
+        // 追踪 IMU 线加速度是否“最近被融合过”
+        std::mutex imu_acc_dbg_mutex_;
+        rclcpp::Time last_imu_acc_stamp_{0, 0, RCL_ROS_TIME};
+        bool last_imu_acc_seen_{false};
 
     protected:
         // std::map<std::string, double> initial_baro_z_;
